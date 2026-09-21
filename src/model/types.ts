@@ -36,18 +36,66 @@ export interface Clip {
 }
 
 export interface Track {
-  id: string; // e.g. uppercase instrument name like 'KICK', 'BASS', or 'FX'
+  id: string;
   name: string;
   color: string;
   muted: boolean;
   soloed: boolean;
 }
 
+// Slice 2: Sections and Seams
+export interface SectionInstance {
+  id: string;
+  name: string;
+  startBeat: number;
+  endBeat: number;
+  bars: number;
+  clipIds: string[];
+}
+
+export type SeamType = 'crossfade' | 'pause';
+
+export interface SeamSettings {
+  type: SeamType;
+  fadeMs: number; // 0..maxFadeMs
+  pauseBeats: number; // 1..32 beats
+}
+
+export interface Seam {
+  id: string;
+  prevSection: SectionInstance;
+  nextSection: SectionInstance;
+  settings: SeamSettings;
+  maxFadeMs: number; // Duration of longest tail in previous section (ms)
+  actualGapBeats: number; // nextSection.startBeat - prevSection.endBeat
+}
+
+// Slice 2: Playback Plan (Pure execution blueprint)
+export interface GainPoint {
+  timeOffsetSec: number; // Seconds relative to clip audio start time
+  gain: number;          // 0.0 .. 1.0
+}
+
+export interface PlaybackEvent {
+  clipId: string;
+  pieceId: string;
+  trackId: string;
+  startBeat: number;
+  durationBeats: number;
+  stopBeat: number; // Exact beat where audio source ends (including tail or cutoff)
+  gainPoints: GainPoint[]; // Automation curve
+}
+
+export interface PlaybackPlan {
+  events: PlaybackEvent[];
+  totalBeats: number;
+}
+
 export interface ProjectState {
   bpm: number;
   pieces: Record<string, Piece>;
   clips: Clip[];
-  trackOrder: string[]; // list of track IDs
+  trackOrder: string[];
   trackSettings: Record<string, { muted: boolean; soloed: boolean }>;
+  seamSettings?: Record<string, SeamSettings>;
 }
-

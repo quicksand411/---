@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Piece, Clip, Track, ProjectState } from '../model/types';
+import { Piece, Clip, Track, ProjectState, SeamSettings, Seam } from '../model/types';
 import { parseStemFilename, getTrackIdForPiece } from '../model/stemParser';
 import { calculateBarsAndTail, recalculatePieceForBpm, getDurationInBeats } from '../model/tempo';
 import { getInstrumentColor } from '../model/timeline';
+import { computeSections } from '../model/sections';
+import { computeSeams, applyPauseRipple } from '../model/seams';
+import { buildPlaybackPlan } from '../model/playbackPlan';
 import { defaultProjectStorage } from '../storage/localStorageProjectStorage';
 import { audioEngine } from '../audio/AudioEngine';
 import { Scheduler } from '../audio/Scheduler';
@@ -17,7 +20,9 @@ export const App: React.FC = () => {
   const [trackSettings, setTrackSettings] = useState<
     Record<string, { muted: boolean; soloed: boolean }>
   >({});
+  const [seamSettings, setSeamSettings] = useState<Record<string, SeamSettings>>({});
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [isAuditioning, setIsAuditioning] = useState<boolean>(false);
   const [currentBeat, setCurrentBeat] = useState<number>(0);
   const [isLoadedFromStorage, setIsLoadedFromStorage] = useState<boolean>(false);
 
@@ -34,6 +39,7 @@ export const App: React.FC = () => {
       },
       onPlaybackEnded: () => {
         setIsPlaying(false);
+        setIsAuditioning(false);
       },
     });
 
@@ -50,12 +56,13 @@ export const App: React.FC = () => {
         setPieces(saved.pieces || {});
         setClips(saved.clips || []);
         setTrackSettings(saved.trackSettings || {});
+        setSeamSettings(saved.seamSettings || {});
       }
       setIsLoadedFromStorage(true);
     });
   }, []);
 
-  // 2. Auto-save project state when bpm, pieces, clips, or trackSettings change
+  // 2. Auto-save project state
   useEffect(() => {
     if (!isLoadedFromStorage) return;
 
@@ -65,15 +72,38 @@ export const App: React.FC = () => {
       clips,
       trackOrder: [],
       trackSettings,
+      seamSettings,
     };
 
     defaultProjectStorage.saveProject(stateToSave);
-  }, [bpm, pieces, clips, trackSettings, isLoadedFromStorage]);
+  }, [bpm, pieces, clips, trackSettings, seamSettings, isLoadedFromStorage]);
 
   // Sync mute/solo changes with AudioEngine during live playback
   useEffect(() => {
     audioEngine.updateTrackRouting(trackSettings);
   }, [trackSettings]);
+
+  // Derive Sections from clips
+  const sections = useMemo(() => {
+    return computeSections(clips, pieces);
+  }, [clips, pieces]);
+
+  // Derive Seams between adjacent sections
+  const seamsResult = useMemo(() => {
+    return computeSeams(sections, seamSettings, clips, pieces);
+  }, [sections, seamSettings, clips, pieces]);
+
+  // Build deterministic Playback Plan
+  const playbackPlan = useMemo(() => {
+    return buildPlaybackPlan({
+      bpm,
+      pieces,
+      clips,
+      trackOrder: [],
+      trackSettings,
+      seamSettings,
+    });
+  }, [bpm, pieces, clips, trackSettings, seamSettings]);
 
   // Compute active tracks from pieces + FX track
   const tracks: Track[] = useMemo(() => {
@@ -86,7 +116,6 @@ export const App: React.FC = () => {
       }
     }
 
-    // Sort instruments alphabetically for consistency
     const sortedInstruments = Array.from(instrumentSet).sort();
 
     const trackList: Track[] = sortedInstruments.map((id) => ({
@@ -109,16 +138,18 @@ export const App: React.FC = () => {
     return trackList;
   }, [pieces, trackSettings]);
 
-  // Handle Playback toggle
+  // Playback controls
   const handlePlay = useCallback(() => {
     if (!schedulerRef.current) return;
     setIsPlaying(true);
-    schedulerRef.current.start(currentBeat, bpm, clips, trackSettings);
-  }, [currentBeat, bpm, clips, trackSettings]);
+    setIsAuditioning(false);
+    schedulerRef.current.start(currentBeat, bpm, playbackPlan, trackSettings);
+  }, [currentBeat, bpm, playbackPlan, trackSettings]);
 
   const handleStop = useCallback(() => {
     if (!schedulerRef.current) return;
     setIsPlaying(false);
+    setIsAuditioning(false);
     schedulerRef.current.stop();
   }, []);
 
@@ -127,16 +158,36 @@ export const App: React.FC = () => {
       const beat = Math.max(0, seekBeat);
       setCurrentBeat(beat);
       if (isPlaying && schedulerRef.current) {
-        schedulerRef.current.start(beat, bpm, clips, trackSettings);
+        schedulerRef.current.start(beat, bpm, playbackPlan, trackSettings);
       }
     },
-    [isPlaying, bpm, clips, trackSettings]
+    [isPlaying, bpm, playbackPlan, trackSettings]
   );
+
+  // Audition Seam (plays ±2 bars around seam)
+  const handleAuditionSeam = useCallback(
+    (seam: Seam) => {
+      if (!schedulerRef.current) return;
+
+      // 2 bars before seam to 2 bars after seam (assuming 4 beats/bar)
+      const fromBeat = Math.max(0, seam.prevSection.endBeat - 8);
+      const toBeat = seam.nextSection.startBeat + 8;
+
+      setIsAuditioning(true);
+      setIsPlaying(true);
+      setCurrentBeat(fromBeat);
+      schedulerRef.current.start(fromBeat, bpm, playbackPlan, trackSettings, toBeat);
+    },
+    [bpm, playbackPlan, trackSettings]
+  );
+
+  const handleStopAudition = useCallback(() => {
+    handleStop();
+  }, [handleStop]);
 
   // Keyboard shortcut: Space to toggle play/stop
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger if user is typing in an input
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLSelectElement ||
@@ -147,7 +198,7 @@ export const App: React.FC = () => {
 
       if (e.code === 'Space') {
         e.preventDefault();
-        if (isPlaying) {
+        if (isPlaying || isAuditioning) {
           handleStop();
         } else {
           handlePlay();
@@ -157,13 +208,12 @@ export const App: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPlaying, handlePlay, handleStop]);
+  }, [isPlaying, isAuditioning, handlePlay, handleStop]);
 
   // BPM change handler
   const handleBpmChange = (newBpm: number) => {
     setBpm(newBpm);
 
-    // Recalculate pieces (bars only if not manually edited)
     setPieces((prev) => {
       const updated: Record<string, Piece> = {};
       for (const [id, piece] of Object.entries(prev)) {
@@ -172,7 +222,6 @@ export const App: React.FC = () => {
       return updated;
     });
 
-    // Update clip durationBeats based on new/preserved bars
     setClips((prevClips) =>
       prevClips.map((clip) => {
         const piece = pieces[clip.pieceId];
@@ -183,14 +232,9 @@ export const App: React.FC = () => {
         };
       })
     );
-
-    // If currently playing, restart scheduler with new BPM
-    if (isPlaying && schedulerRef.current) {
-      schedulerRef.current.start(currentBeat, newBpm, clips, trackSettings);
-    }
   };
 
-  // Process decoded audio files (from Folder Picker or Drag & Drop)
+  // Process decoded audio files
   const processAudioFiles = async (files: File[] | FileList) => {
     const fileArray = Array.from(files).filter(
       (f) => f.name.toLowerCase().endsWith('.wav') || f.type === 'audio/wav'
@@ -209,7 +253,6 @@ export const App: React.FC = () => {
         const existing = updatedPieces[file.name];
 
         if (existing) {
-          // Preserve manual edits from storage
           const recalculated = recalculatePieceForBpm(
             {
               ...existing,
@@ -219,7 +262,6 @@ export const App: React.FC = () => {
           );
           updatedPieces[file.name] = recalculated;
         } else {
-          // New stem file
           const meta = parseStemFilename(file.name);
           const { bars, tail } = calculateBarsAndTail(duration, bpm, '4/4');
 
@@ -267,7 +309,6 @@ export const App: React.FC = () => {
           alert('No WAV files found in the selected folder.');
         }
       } catch (err: unknown) {
-        // User cancelled or aborted picker
         if ((err as Error).name !== 'AbortError') {
           console.error('Directory picker error:', err);
         }
@@ -284,7 +325,6 @@ export const App: React.FC = () => {
       [updated.id]: updated,
     }));
 
-    // Update any clips on timeline referencing this piece
     const newTargetTrackId = getTrackIdForPiece(updated);
     const newDurationBeats = getDurationInBeats(updated.bars, updated.meter);
 
@@ -338,10 +378,27 @@ export const App: React.FC = () => {
     setClips((prev) => prev.filter((c) => c.id !== clipId));
   };
 
+  // Seam updates and pause ripple shift
+  const handleUpdateSeam = (seamId: string, newSettings: SeamSettings) => {
+    const targetSeam = seamsResult.seams.find((s) => s.id === seamId);
+
+    if (targetSeam && newSettings.type === 'pause' && newSettings.pauseBeats !== targetSeam.settings.pauseBeats) {
+      // Ripple shift clips following this seam
+      const shiftedClips = applyPauseRipple(clips, targetSeam, newSettings.pauseBeats);
+      setClips(shiftedClips);
+    }
+
+    setSeamSettings((prev) => ({
+      ...prev,
+      [seamId]: newSettings,
+    }));
+  };
+
   const handleResetProject = () => {
     if (window.confirm('Reset current arrangement and timeline clips? (Stems library will remain)')) {
       handleStop();
       setClips([]);
+      setSeamSettings({});
       setCurrentBeat(0);
     }
   };
@@ -351,7 +408,7 @@ export const App: React.FC = () => {
     e.dataTransfer.effectAllowed = 'copy';
   };
 
-  // Calculate total arrangement bars for display
+  // Calculate total arrangement bars
   const totalArrangementBars = useMemo(() => {
     if (clips.length === 0) return 0;
     const maxBeat = Math.max(...clips.map((c) => c.startBeat + c.durationBeats));
@@ -363,7 +420,7 @@ export const App: React.FC = () => {
       <Header
         bpm={bpm}
         onBpmChange={handleBpmChange}
-        isPlaying={isPlaying}
+        isPlaying={isPlaying || isAuditioning}
         onPlay={handlePlay}
         onStop={handleStop}
         onOpenFolder={handleOpenFolder}
@@ -385,6 +442,11 @@ export const App: React.FC = () => {
           tracks={tracks}
           clips={clips}
           pieces={pieces}
+          sections={sections}
+          seams={seamsResult.seams}
+          hasOverlappingSections={seamsResult.hasOverlappingSections}
+          bpm={bpm}
+          isAuditioning={isAuditioning}
           currentBeat={currentBeat}
           pixelsPerBeat={PIXELS_PER_BEAT}
           totalBeats={TOTAL_BEATS}
@@ -394,6 +456,9 @@ export const App: React.FC = () => {
           onAddClip={handleAddClip}
           onMoveClip={handleMoveClip}
           onDeleteClip={handleDeleteClip}
+          onUpdateSeam={handleUpdateSeam}
+          onAuditionSeam={handleAuditionSeam}
+          onStopAudition={handleStopAudition}
         />
       </main>
     </div>
@@ -401,4 +466,3 @@ export const App: React.FC = () => {
 };
 
 export default App;
-

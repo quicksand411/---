@@ -1,4 +1,4 @@
-import { Clip } from '../model/types';
+import { PlaybackPlan, PlaybackEvent } from '../model/types';
 import { audioEngine } from './AudioEngine';
 
 export interface SchedulerCallbacks {
@@ -11,17 +11,18 @@ export class Scheduler {
   private bpm = 140;
   private playbackStartTime = 0; // AudioContext.currentTime when playback began
   private playbackStartBeat = 0; // Timeline beat when playback began
+  private stopAtBeat: number | null = null; // Used for Audition mode
   private timerId: number | null = null;
   private animFrameId: number | null = null;
 
-  private clips: Clip[] = [];
-  private scheduledClips = new Set<string>();
+  private events: PlaybackEvent[] = [];
+  private scheduledEvents = new Set<string>();
   private activeSources: AudioBufferSourceNode[] = [];
   private callbacks: SchedulerCallbacks = {};
 
   // Timing constants (standard Web Audio look-ahead)
-  private readonly INTERVAL_MS = 25;       // Clock check interval
-  private readonly LOOKAHEAD_SEC = 0.12;   // Lookahead window in seconds
+  private readonly INTERVAL_MS = 25;      // Clock check interval
+  private readonly LOOKAHEAD_SEC = 0.12;  // Lookahead window in seconds
 
   constructor(callbacks: SchedulerCallbacks = {}) {
     this.callbacks = callbacks;
@@ -45,8 +46,9 @@ export class Scheduler {
   public async start(
     startBeat: number,
     bpm: number,
-    clips: Clip[],
-    trackSettings: Record<string, { muted: boolean; soloed: boolean }>
+    plan: PlaybackPlan,
+    trackSettings: Record<string, { muted: boolean; soloed: boolean }>,
+    stopAtBeat?: number
   ): Promise<void> {
     if (this.isPlaying) {
       this.stop();
@@ -57,10 +59,11 @@ export class Scheduler {
 
     this.isPlaying = true;
     this.bpm = bpm;
-    this.clips = clips;
+    this.events = plan.events;
     this.playbackStartBeat = Math.max(0, startBeat);
-    this.playbackStartTime = ctx.currentTime + 0.03; // small 30ms offset to avoid instantaneous scheduling jitter
-    this.scheduledClips.clear();
+    this.stopAtBeat = stopAtBeat !== undefined ? stopAtBeat : null;
+    this.playbackStartTime = ctx.currentTime + 0.03; // 30ms offset to avoid jitter
+    this.scheduledEvents.clear();
     this.activeSources = [];
 
     // Ensure track routings (Mute / Solo) are up to date
@@ -72,7 +75,7 @@ export class Scheduler {
     // Start UI playhead animation loop
     this.startAnimationLoop();
 
-    // Initial pass right away
+    // Initial pass immediately
     this.scheduleNext();
   }
 
@@ -80,6 +83,7 @@ export class Scheduler {
     if (!this.isPlaying) return;
 
     this.isPlaying = false;
+    this.stopAtBeat = null;
 
     if (this.timerId !== null) {
       clearInterval(this.timerId);
@@ -91,17 +95,17 @@ export class Scheduler {
       this.animFrameId = null;
     }
 
-    // Stop and disconnect all currently playing nodes
+    // Stop and disconnect all active audio nodes
     for (const source of this.activeSources) {
       try {
         source.stop();
         source.disconnect();
       } catch {
-        // Node might have already ended naturally
+        // Source may have already ended
       }
     }
     this.activeSources = [];
-    this.scheduledClips.clear();
+    this.scheduledEvents.clear();
   }
 
   private scheduleNext(): void {
@@ -111,60 +115,60 @@ export class Scheduler {
     const currentTime = ctx.currentTime;
     const lookaheadUntilTime = currentTime + this.LOOKAHEAD_SEC;
 
-    for (const clip of this.clips) {
-      if (this.scheduledClips.has(clip.id)) continue;
-
-      const buffer = audioEngine.getBuffer(clip.pieceId);
-      if (!buffer) continue; // Buffer not loaded yet, skip
-
-      // How many beats does the entire buffer take?
-      const bufferDurationBeats = (buffer.duration * this.bpm) / 60;
-      const clipEndBeatWithTail = clip.startBeat + bufferDurationBeats;
-
-      // Calculate the audio context time when this clip's startBeat should hit
-      const clipAudioStartTime =
-        this.playbackStartTime +
-        ((clip.startBeat - this.playbackStartBeat) * 60) / this.bpm;
-
-      // Case 1: Clip starts in future within lookahead window
-      if (clipAudioStartTime >= currentTime && clipAudioStartTime <= lookaheadUntilTime) {
-        this.playClipSource(clip, buffer, clipAudioStartTime, 0);
-        this.scheduledClips.add(clip.id);
+    // Check audition stop limit
+    const currentBeat = this.getCurrentBeat();
+    if (this.stopAtBeat !== null && currentBeat >= this.stopAtBeat) {
+      this.stop();
+      if (this.callbacks.onPlaybackEnded) {
+        this.callbacks.onPlaybackEnded();
       }
-      // Case 2: Playhead started in the middle of this clip
+      return;
+    }
+
+    for (const event of this.events) {
+      if (this.scheduledEvents.has(event.clipId)) continue;
+
+      const buffer = audioEngine.getBuffer(event.pieceId);
+      if (!buffer) continue;
+
+      // Calculate audio time when event starts
+      const eventAudioStartTime =
+        this.playbackStartTime +
+        ((event.startBeat - this.playbackStartBeat) * 60) / this.bpm;
+
+      const eventAudioStopTime =
+        this.playbackStartTime +
+        ((event.stopBeat - this.playbackStartBeat) * 60) / this.bpm;
+
+      // Case 1: Event starts in future within lookahead window
+      if (eventAudioStartTime >= currentTime && eventAudioStartTime <= lookaheadUntilTime) {
+        this.playEventSource(event, buffer, eventAudioStartTime, 0, eventAudioStopTime);
+        this.scheduledEvents.add(event.clipId);
+      }
+      // Case 2: Playhead started in the middle of this event
       else if (
-        this.playbackStartBeat >= clip.startBeat &&
-        this.playbackStartBeat < clipEndBeatWithTail
+        this.playbackStartBeat >= event.startBeat &&
+        this.playbackStartBeat < event.stopBeat
       ) {
-        const offsetBeats = this.playbackStartBeat - clip.startBeat;
+        const offsetBeats = this.playbackStartBeat - event.startBeat;
         const offsetSeconds = (offsetBeats * 60) / this.bpm;
 
         if (offsetSeconds < buffer.duration) {
-          // Start immediately at playbackStartTime with the computed offset
           const immediateStart = Math.max(currentTime, this.playbackStartTime);
-          this.playClipSource(clip, buffer, immediateStart, offsetSeconds);
+          this.playEventSource(event, buffer, immediateStart, offsetSeconds, eventAudioStopTime);
         }
-        this.scheduledClips.add(clip.id);
+        this.scheduledEvents.add(event.clipId);
       }
-      // Case 3: Clip is entirely in the past
-      else if (clipEndBeatWithTail < this.playbackStartBeat) {
-        this.scheduledClips.add(clip.id);
+      // Case 3: Event is completely in the past
+      else if (event.stopBeat <= this.playbackStartBeat) {
+        this.scheduledEvents.add(event.clipId);
       }
     }
 
-    // Auto-stop if we passed the end of all scheduled clips
-    if (this.clips.length > 0) {
-      const maxBeat = Math.max(
-        ...this.clips.map((c) => {
-          const buf = audioEngine.getBuffer(c.pieceId);
-          const bufBeats = buf ? (buf.duration * this.bpm) / 60 : c.durationBeats;
-          return c.startBeat + bufBeats;
-        })
-      );
-
-      const currentBeat = this.getCurrentBeat();
-      // If we passed all clips + 4 beats margin, auto-stop
-      if (currentBeat > maxBeat + 4 && this.activeSources.length === 0) {
+    // Auto-stop when reaching end of project (if not in audition mode)
+    if (this.stopAtBeat === null && this.events.length > 0) {
+      const maxStopBeat = Math.max(...this.events.map((e) => e.stopBeat));
+      if (currentBeat > maxStopBeat + 4 && this.activeSources.length === 0) {
         this.stop();
         if (this.callbacks.onPlaybackEnded) {
           this.callbacks.onPlaybackEnded();
@@ -173,19 +177,28 @@ export class Scheduler {
     }
   }
 
-  private playClipSource(
-    clip: Clip,
+  private playEventSource(
+    event: PlaybackEvent,
     buffer: AudioBuffer,
     startTime: number,
-    offsetSeconds: number
+    offsetSeconds: number,
+    stopAudioTime: number
   ): void {
     const ctx = audioEngine.getContext();
     const source = ctx.createBufferSource();
     source.buffer = buffer;
 
-    // Route through the track's GainNode (for mute / solo)
-    const trackGain = audioEngine.getOrCreateTrackGain(clip.trackId);
-    source.connect(trackGain);
+    // Per-clip dynamic GainNode for volume automation
+    const clipGain = ctx.createGain();
+    clipGain.gain.setValueAtTime(1.0, ctx.currentTime);
+
+    // Apply automation curve points
+    this.scheduleGainEnvelope(clipGain, event.gainPoints, startTime, offsetSeconds);
+
+    // Route: Source -> Clip Gain -> Track Gain -> Master Gain
+    const trackGain = audioEngine.getOrCreateTrackGain(event.trackId);
+    source.connect(clipGain);
+    clipGain.connect(trackGain);
 
     source.onended = () => {
       const idx = this.activeSources.indexOf(source);
@@ -194,14 +207,49 @@ export class Scheduler {
       }
       try {
         source.disconnect();
+        clipGain.disconnect();
       } catch {
         // Ignored
       }
     };
 
-    // Entire buffer plays, preserving full reverb tail!
+    // Start with offset
     source.start(startTime, offsetSeconds);
+
+    // Stop cleanly at stopAudioTime
+    if (stopAudioTime > startTime) {
+      source.stop(stopAudioTime);
+    }
+
     this.activeSources.push(source);
+  }
+
+  private scheduleGainEnvelope(
+    gainNode: GainNode,
+    gainPoints: PlaybackEvent['gainPoints'],
+    clipAudioStartTime: number,
+    initialOffsetSec: number
+  ): void {
+    if (!gainPoints || gainPoints.length === 0) return;
+
+    const ctx = audioEngine.getContext();
+    const now = ctx.currentTime;
+
+    for (let i = 0; i < gainPoints.length; i++) {
+      const pt = gainPoints[i];
+      // Target time for this gain point
+      const targetTime = clipAudioStartTime + Math.max(0, pt.timeOffsetSec - initialOffsetSec);
+
+      if (i === 0) {
+        gainNode.gain.setValueAtTime(pt.gain, Math.max(now, targetTime));
+      } else {
+        if (targetTime > now) {
+          gainNode.gain.linearRampToValueAtTime(pt.gain, targetTime);
+        } else {
+          gainNode.gain.setValueAtTime(pt.gain, now);
+        }
+      }
+    }
   }
 
   private startAnimationLoop(): void {

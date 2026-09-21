@@ -1,13 +1,20 @@
 import React, { useRef, useState } from 'react';
-import { Track, Clip, Piece } from '../../model/types';
+import { Track, Clip, Piece, SectionInstance, Seam, SeamSettings } from '../../model/types';
 import { TrackHeader } from './TrackHeader';
 import { TrackLane } from './TrackLane';
 import { Ruler } from './Ruler';
+import { SectionLane } from './SectionLane';
+import { SeamModal } from './SeamModal';
 
 interface TimelineViewProps {
   tracks: Track[];
   clips: Clip[];
   pieces: Record<string, Piece>;
+  sections: SectionInstance[];
+  seams: Seam[];
+  hasOverlappingSections: boolean;
+  bpm: number;
+  isAuditioning: boolean;
   currentBeat: number;
   pixelsPerBeat: number;
   totalBeats: number;
@@ -17,12 +24,20 @@ interface TimelineViewProps {
   onAddClip: (clip: Clip) => void;
   onMoveClip: (clipId: string, newStartBeat: number) => void;
   onDeleteClip: (clipId: string) => void;
+  onUpdateSeam: (seamId: string, settings: SeamSettings) => void;
+  onAuditionSeam: (seam: Seam) => void;
+  onStopAudition: () => void;
 }
 
 export const TimelineView: React.FC<TimelineViewProps> = ({
   tracks,
   clips,
   pieces,
+  sections,
+  seams,
+  hasOverlappingSections,
+  bpm,
+  isAuditioning,
   currentBeat,
   pixelsPerBeat,
   totalBeats,
@@ -32,9 +47,13 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
   onAddClip,
   onMoveClip,
   onDeleteClip,
+  onUpdateSeam,
+  onAuditionSeam,
+  onStopAudition,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [activeEditingSeamId, setActiveEditingSeamId] = useState<string | null>(null);
 
   const handleNotifyError = (msg: string) => {
     setErrorMessage(msg);
@@ -47,6 +66,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
   };
 
   const playheadX = currentBeat * pixelsPerBeat;
+  const activeEditingSeam = seams.find((s) => s.id === activeEditingSeamId);
 
   return (
     <section className="timeline-container">
@@ -64,6 +84,7 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
         <div className="arrangement-view">
           {/* Left: Fixed Track Headers Column */}
           <div className="track-headers-column">
+            {/* Top spacer matching section lane + ruler height */}
             <div className="track-headers-top-spacer">
               <span>TRACKS & INSTRUMENTS</span>
             </div>
@@ -81,6 +102,17 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
 
           {/* Right: Scrollable Timeline Grid */}
           <div className="timeline-scroll-area" ref={scrollContainerRef}>
+            {/* Section Lane above the ruler */}
+            <SectionLane
+              sections={sections}
+              seams={seams}
+              hasOverlappingSections={hasOverlappingSections}
+              pixelsPerBeat={pixelsPerBeat}
+              totalBeats={totalBeats}
+              selectedSeamId={activeEditingSeamId}
+              onSelectSeam={(seam) => setActiveEditingSeamId(seam.id)}
+            />
+
             {/* Top Ruler */}
             <Ruler
               totalBeats={totalBeats}
@@ -120,7 +152,22 @@ export const TimelineView: React.FC<TimelineViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Seam Configuration Modal */}
+      {activeEditingSeam && (
+        <SeamModal
+          seam={activeEditingSeam}
+          bpm={bpm}
+          isAuditioning={isAuditioning}
+          onUpdateSeam={onUpdateSeam}
+          onAudition={onAuditionSeam}
+          onStopAudition={onStopAudition}
+          onClose={() => {
+            if (isAuditioning) onStopAudition();
+            setActiveEditingSeamId(null);
+          }}
+        />
+      )}
     </section>
   );
 };
-
